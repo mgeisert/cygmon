@@ -156,6 +156,7 @@ static size_t
 sample (HANDLE h)
 {
   static CONTEXT *context = NULL;
+  size_t status;
 
   if (!context)
     {
@@ -165,18 +166,20 @@ sample (HANDLE h)
 
   if (-1 == SuspendThread (h))
     return 0ULL;
-  if (0 == GetThreadContext (h, context))
+  status = GetThreadContext (h, context);
+  if (-1 == ResumeThread (h))
+    note ("*** unable to resume thread %d\n", h);
+
+  if (status)
     {
 //    note ("*** unable to get context for thread %d\n", h);
       return 0ULL;
     }
-  if (-1 == ResumeThread (h))
-    note ("*** unable to resume thread %d\n", h);
-
+  else
 #ifdef _WIN64
-  return context->Rip;
+    return context->Rip;
 #else
-  return context->Eip;
+    return context->Eip;
 #endif
 }
 
@@ -822,8 +825,8 @@ profile1 (FILE *ofile, pid_t pid)
             {
               status = DBG_EXCEPTION_NOT_HANDLED;
               if (ev.u.Exception.dwFirstChance)
-                note ("--- Process %lu, exception %08lx at %p\n",
-                      ev.dwProcessId,
+                note ("--- Process %lu thread %lu exception %08lx at %p\n",
+                      ev.dwProcessId, ev.dwThreadId,
                       ev.u.Exception.ExceptionRecord.ExceptionCode,
                       ev.u.Exception.ExceptionRecord.ExceptionAddress);
             } 
