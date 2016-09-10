@@ -170,7 +170,7 @@ sample (HANDLE h)
   if (-1 == ResumeThread (h))
     note ("*** unable to resume thread %d\n", h);
 
-  if (status)
+  if (0 == status)
     {
 //    note ("*** unable to get context for thread %d\n", h);
       return 0ULL;
