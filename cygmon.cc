@@ -1,17 +1,15 @@
 /*
-   cygmon.cc
-   Periodically samples PC of a process and its DLLs; writes gprof data files.
+    cygmon.cc
+    Periodically samples PC of a process and its DLLs; writes gprof data files.
 
-   Copyright 2016 Red Hat Inc.
+    Written by Mark Geisert <mark@maxrnd.com>, who admits to
+    copying liberally from strace.cc.  h/t to cgf for strace!
 
-   Written by Mark Geisert <mark@maxrnd.com>, who admits to
-   copying liberally from strace.cc.  Props to cgf for strace!
+    This file is part of Cygwin.
 
-This file is part of Cygwin.
-
-This software is a copyrighted work licensed under the terms of the
-Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
-details. */
+    This software is a copyrighted work licensed under the terms of the
+    Cygwin license.  Please consult the file "CYGWIN_LICENSE" for details.
+*/
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -35,18 +33,20 @@ typedef unsigned short u_int16_t;
 
 #define SCALE_SHIFT 2     // == 4 bytes of address space per bucket
 
+static DWORD       child_pid;
+static void       *drive_map;
+static int         events = 1;
+static int         forkdebug = 1;
+static int         new_window;
+static int         numprocesses;
 static const char *pgm;
-static int forkdebug = 1;
-static int events = 1;
-static int new_window;
-static char *prefix = (char *) "gmon.out";
-static int quiet = -1;
-static int samplerate = 100; // in Hz; up to 1000 might work
+static char       *prefix = (char *) "gmon.out";
+static int         quiet = -1;
+static int         samplerate = 100; // in Hz; up to 1000 might work
 
-static int numprocesses;
-static DWORD child_pid;
-static void *drive_map;
-
+//FIXME Make sure strace options cygmon doesn't use are deleted.  Here and
+//FIXME later on in the options definitions.  Double check that all supported
+//FIXME options work as they're supposed to.
 static void
 usage (FILE *where = stderr)
 {
@@ -73,35 +73,35 @@ Profiles a command or an existing process\n\
 // a span is a memory address range covering an EXE's or DLL's .text segment
 struct span_list
 {
-  WCHAR *name;
-  LPVOID base;
-  size_t textlo;
-  size_t texthi;
-  int hitcount;
-  int numbuckets;
-  short *buckets;
+  WCHAR  *name;
+  LPVOID  base;
+  size_t  textlo;
+  size_t  texthi;
+  int     hitcount;
+  int     numbuckets;
+  short  *buckets;
   struct span_list *next;
 };
 
 // a thread
 struct thread_list
 {
-  DWORD tid;
+  DWORD  tid;
   HANDLE hthread;
   struct thread_list *next;
 };
 
-// a child is any process being sampled in this run
+// a child is any process being sampled in this cygmon run
 struct child_list
 {
-  DWORD pid;
+  DWORD  pid;
   HANDLE hproc;
   HANDLE hquitevt;
   HANDLE hprofthr;
   volatile int profiling;
   struct thread_list *threads;
-  struct span_list *spans;
-  struct child_list *next;
+  struct span_list   *spans;
+  struct child_list  *next;
 };
 
 child_list children;
@@ -111,7 +111,7 @@ static void
 note (const char *fmt, ...)
 {
   va_list args;
-  char buf[4096];
+  char    buf[4096];
 
   va_start (args, fmt);
   vsprintf (buf, fmt, args);
@@ -125,7 +125,7 @@ static void
 warn (int geterrno, const char *fmt, ...)
 {
   va_list args;
-  char buf[4096];
+  char    buf[4096];
 
   va_start (args, fmt);
   sprintf (buf, "%s: ", pgm);
@@ -172,7 +172,8 @@ sample (HANDLE h)
 
   if (0 == status)
     {
-//    note ("*** unable to get context for thread %d\n", h);
+      if (!quiet)
+        note ("*** unable to get context for thread %d\n", h);
       return 0ULL;
     }
   else
@@ -233,9 +234,10 @@ static void
 start_profiler (child *c)
 {
   HANDLE h;
-  DWORD tid;
+  DWORD  tid;
 
-//note ("*** start profiler thread on pid %lu\n", c->pid);
+  if (!quiet)
+    note ("*** start profiler thread on pid %lu\n", c->pid);
   c->hquitevt = CreateEvent (NULL, TRUE, FALSE, NULL);
   if (!c->hquitevt)
     error (0, "unable to create quit event\n");
@@ -244,27 +246,29 @@ start_profiler (child *c)
   if (!c->hprofthr)
     error (0, "unable to create profiling thread\n");
 
-//SetThreadPriority (c->hprofthr, THREAD_PRIORITY_TIME_CRITICAL);
+//SetThreadPriority (c->hprofthr, THREAD_PRIORITY_TIME_CRITICAL); Don't do this!
 }
 
 static void
 stop_profiler (child *c)
 {
-//note ("*** stop profiler thread on pid %lu\n", c->pid);
+  if (!quiet)
+    note ("*** stop profiler thread on pid %lu\n", c->pid);
   c->profiling = 0;
   SignalObjectAndWait (c->hquitevt, c->hprofthr, INFINITE, FALSE);
   CloseHandle (c->hquitevt);
   CloseHandle (c->hprofthr);
+  c->hquitevt = c->hprofthr = 0;
 }
 
 // create a gmon.out file for each EXE or DLL that has at least one sample
 static void
 dump_profile_data (child *c)
 {
-  span_list *s = c->spans;
-  int fd;
-  char filename[MAX_PATH + 1];
+  int        fd;
+  char       filename[MAX_PATH + 1];
   struct gmonhdr hdr;
+  span_list *s = c->spans;
 
   while (s)
     {
@@ -282,6 +286,7 @@ dump_profile_data (child *c)
       else
         sprintf (filename, "%s.%d", prefix, c->pid);
 
+      //FIXME not sure 0666 is enough to prevent x-bits on output file
       fd = open (filename, O_CREAT|O_TRUNC|O_WRONLY|O_BINARY, 0666);
       if (fd < 0)
         error (0, "dump_profile_data: unable to create %s\n", filename);
@@ -303,8 +308,8 @@ dump_profile_data (child *c)
     }
 }
 
-DWORD lastpid = 0;
 HANDLE lasth;
+DWORD  lastpid = 0;
 
 static child *
 get_child (DWORD pid)
@@ -352,6 +357,8 @@ remove_child (DWORD pid)
         c->next = c1->next;
         stop_profiler (c1);
         dump_profile_data (c1);
+        CloseHandle (c1->hproc);
+        c1->hproc = 0;
         free (c1);
         if (!quiet)
           note ("Windows process %lu detached\n", pid);
@@ -392,6 +399,7 @@ remove_thread (DWORD pid, DWORD tid)
       if (t->tid == tid)
         {
           t->tid = 0;
+          CloseHandle (t->hthread);
           t->hthread = 0;
           return;
         }
@@ -416,17 +424,18 @@ read_child (void *buf, SIZE_T size, void *addr, HANDLE h)
 static IMAGE_SECTION_HEADER *
 find_text_section (LPVOID base, HANDLE h)
 {
-  char *ptr = (char *) base;
   static IMAGE_SECTION_HEADER asect;
-  DWORD lfanew;
-  WORD nsects;
-  DWORD ntsig;
+  DWORD  lfanew;
+  WORD   nsects;
+  DWORD  ntsig;
+  char  *ptr = (char *) base;
 
   IMAGE_DOS_HEADER *idh = (IMAGE_DOS_HEADER *) ptr;
   read_child ((void *) &lfanew, sizeof (lfanew), &idh->e_lfanew, h);
   ptr += lfanew;
 
-  // code handles either 32- or 64-bit headers depending on how this is compiled
+  // code handles either 32- or 64-bit headers depending on compilation
+  //FIXME it does not yet handle 32-bit executables on 64-bit Cygwin or v/v
   IMAGE_NT_HEADERS *inth = (IMAGE_NT_HEADERS *) ptr;
   read_child ((void *) &ntsig, sizeof (ntsig), &inth->Signature, h);
   if (ntsig != IMAGE_NT_SIGNATURE)
@@ -474,10 +483,10 @@ add_span (DWORD pid, WCHAR *name, LPVOID base, HANDLE h)
 
 class linebuf
 {
-  size_t alloc;
+  size_t  alloc;
 public:
-    size_t ix;
-  char *buf;
+  size_t  ix;
+  char   *buf;
   linebuf ()
   {
     ix = 0;
@@ -515,7 +524,7 @@ linebuf::add (const char *what, int len)
 void
 linebuf::prepend (const char *what, int len)
 {
-  int buflen;
+  int    buflen;
   size_t newix;
 
   if ((newix = ix + len) >= alloc)
@@ -565,6 +574,10 @@ make_command_line (linebuf & one_line, char **argv)
     one_line.add ("", 1);
 }
 
+//FIXME Make sure Ctrl-C operates as intended.  What, exactly, is intended?
+//FIXME Looks like strace passes it to child, presumably letting the possibly
+//FIXME resulting child exit end the strace run.  I believe cygmon should
+//FIXME act the same way.
 static BOOL WINAPI
 ctrl_c (DWORD)
 {
@@ -576,6 +589,10 @@ ctrl_c (DWORD)
            GetLastError ());
   return TRUE;
 }
+
+//FIXME Should there be a way to gracefully end cygmon with or without
+//FIXME killing any spawned children?  Maybe Ctrl-C should prompt user
+//FIXME with "Continue, Interrupt, Detach, or Exit?" or some such?
 
 extern "C" {
 uintptr_t (*cygwin_internal) (int, ...);
@@ -604,6 +621,7 @@ load_cygwin ()
       errno = ENOSYS;
       return 0;
     }
+
   return 1;
 }
 
@@ -643,12 +661,11 @@ attach_process (pid_t pid)
 static void
 create_child (char **argv)
 {
-  linebuf one_line;
-
-  STARTUPINFO si;
+  DWORD               flags;
+  linebuf             one_line;
   PROCESS_INFORMATION pi;
-  BOOL ret;
-  DWORD flags;
+  BOOL                ret;
+  STARTUPINFO         si;
 
   if (strchr (*argv, '/'))
       *argv = cygpath (*argv, NULL);
@@ -663,12 +680,15 @@ create_child (char **argv)
   make_command_line (one_line, argv);
 
   SetConsoleCtrlHandler (NULL, 0);
+
   const char *cygwin_env = getenv ("CYGWIN");
   const char *space;
-  if (cygwin_env)
+
+  if (cygwin_env && strlen (cygwin_env) <= 256) /* sanity check */
     space = " ";
   else
     space = cygwin_env = "";
+
   char *newenv = (char *) malloc (sizeof ("CYGWIN=noglob") + strlen (space) + strlen (cygwin_env));
   sprintf (newenv, "CYGWIN=noglob%s%s", space, cygwin_env);
   _putenv (newenv);
@@ -693,14 +713,14 @@ create_child (char **argv)
 static void __stdcall
 handle_output_debug_string (DWORD id, LPVOID p, FILE *ofile)
 {
-  //FIXME not sure we need to do anything with this
+  //FIXME Check strace again.  See if cygmon needs to mimic strace processing.
 }
 
 static BOOL
 GetFileNameFromHandle (HANDLE hFile, WCHAR pszFilename[MAX_PATH+1])
 {
-  BOOL result = FALSE;
-  ULONG len = 0;
+  BOOL     result = FALSE;
+  ULONG    len = 0;
   OBJECT_NAME_INFORMATION *ntfn = (OBJECT_NAME_INFORMATION *) alloca (65536);
   NTSTATUS status = NtQueryObject (hFile, ObjectNameInformation,
                                    ntfn, 65536, &len);
@@ -717,22 +737,23 @@ GetFileNameFromHandle (HANDLE hFile, WCHAR pszFilename[MAX_PATH+1])
       wcsncat (pszFilename, win32path, MAX_PATH);
       result = TRUE;
     }
+
   return result;
 }
 
 static DWORD
 profile1 (FILE *ofile, pid_t pid)
 {
-  DWORD res = 0;
+  time_t      cur_time, last_time;
   DEBUG_EVENT ev;
-  time_t cur_time, last_time;
+  DWORD       res = 0;
 
   SetThreadPriority (GetCurrentThread (), THREAD_PRIORITY_HIGHEST);
   last_time = time (NULL);
   while (1)
     {
-      // wait 10 secs for debug event for less system impact when no events
-      BOOL debug_event = WaitForDebugEvent (&ev, 10000);
+      // wait 30 secs for debug event for less system impact when no events
+      BOOL debug_event = WaitForDebugEvent (&ev, 30000);
       DWORD status = DBG_CONTINUE;
 
       if (!debug_event)
@@ -825,7 +846,7 @@ profile1 (FILE *ofile, pid_t pid)
             {
               status = DBG_EXCEPTION_NOT_HANDLED;
               if (ev.u.Exception.dwFirstChance)
-                note ("--- Process %lu thread %lu exception %08lx at %p\n",
+                note ("--- Process %lu thread %lu exception %08x at %p\n",
                       ev.dwProcessId, ev.dwThreadId,
                       ev.u.Exception.ExceptionRecord.ExceptionCode,
                       ev.u.Exception.ExceptionRecord.ExceptionAddress);
@@ -857,16 +878,16 @@ doprofile (FILE *ofile, pid_t pid, char **argv)
 }
 
 struct option longopts[] = {
-  {"events", no_argument, NULL, 'e'},
-  {"help", no_argument, NULL, 'h'},
-  {"new-window", no_argument, NULL, 'w'},
-  {"output", required_argument, NULL, 'o'},
-  {"pid", required_argument, NULL, 'p'},
-  {"profile-children", no_argument, NULL, 'f'},
-  {"quiet", no_argument, NULL, 'q'},
-  {"sample-rate", required_argument, NULL, 's'},
-  {"version", no_argument, NULL, 'V'},
-  {NULL, 0, NULL, 0}
+  {"events",           no_argument,       NULL, 'e'},
+  {"help",             no_argument,       NULL, 'h'},
+  {"new-window",       no_argument,       NULL, 'w'},
+  {"output",           required_argument, NULL, 'o'},
+  {"pid",              required_argument, NULL, 'p'},
+  {"profile-children", no_argument,       NULL, 'f'},
+  {"quiet",            no_argument,       NULL, 'q'},
+  {"sample-rate",      required_argument, NULL, 's'},
+  {"version",          no_argument,       NULL, 'V'},
+  {NULL,               0,                 NULL, 0  }
 };
 
 static const char *const opts = "+ehfo:p:qs:Vw";
@@ -876,22 +897,23 @@ print_version ()
 {
   printf ("cygmon (cygwin) %d.%d.%d\n"
           "System Profiler\n"
-          "Copyright (C) 2016 Red Hat, Inc.\n"
+          "Copyright © 2016 - %s Cygwin Authors\n"
           "This is free software; see the source for copying conditions.  There is NO\n"
           "warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n",
           CYGWIN_VERSION_DLL_MAJOR / 1000,
           CYGWIN_VERSION_DLL_MAJOR % 1000,
-          CYGWIN_VERSION_DLL_MINOR );
+          CYGWIN_VERSION_DLL_MINOR,
+          strrchr (__DATE__, ' ') + 1);
 }
 
 int
 main2 (int argc, char **argv)
 {
-  FILE *ofile = NULL;
-  pid_t pid = 0;
-  int opt;
-  int sawquiet = -1;
-  DWORD ret = 0;
+  FILE  *ofile = NULL;
+  int    opt;
+  pid_t  pid = 0;
+  DWORD  ret = 0;
+  int    sawquiet = -1;
 
   if (load_cygwin ())
     {
@@ -912,13 +934,16 @@ main2 (int argc, char **argv)
       case 'e':
         events ^= 1;
         break;
+
       case 'f':
         forkdebug ^= 1;
         break;
+
       case 'h':
         // Print help and exit
         usage (stdout);
         break;
+
       case 'o':
         if ((ofile = fopen (cygpath (optarg, NULL), "wb")) == NULL)
           error (1, "can't open %s", optarg);
@@ -926,27 +951,33 @@ main2 (int argc, char **argv)
         (void) fcntl (fileno (ofile), F_SETFD, 0);
 #endif
         break;
+
       case 'p':
         pid = strtoul (optarg, NULL, 10);
         break;
+
       case 'q':
         if (sawquiet < 0)
           sawquiet = 1;
         else
           sawquiet ^= 1;
         break;
+
       case 's':
         samplerate = strtoul (optarg, NULL, 10);
         if (samplerate < 1 || samplerate > 1000)
           error (0, "sample rate must be between 1 and 1000 inclusive");
         break;
+
       case 'V':
         // Print version info and exit
         print_version ();
         return 0;
+
       case 'w':
         new_window ^= 1;
         break;
+
       default:
         note ("Try `%s --help' for more information.\n", pgm);
         exit (1);
@@ -988,6 +1019,6 @@ main (int argc, char **argv)
    */
   char buf[CYGTLS_PADSIZE];
 
-  memset (buf, 0, sizeof (buf));
+  RtlSecureZeroMemory (buf, sizeof (buf));
   exit (main2 (argc, argv));
 }
