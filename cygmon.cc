@@ -415,6 +415,7 @@ remove_thread (DWORD pid, DWORD tid)
           t->hthread = 0;
           if (t->name)
             free (t->name);
+          t->name = NULL;
           return;
         }
       t = t->next;
@@ -450,7 +451,7 @@ find_text_section (LPVOID base, HANDLE h)
   ptr += lfanew;
 
   /* Code handles 32- or 64-bit headers depending on compilation environment. */
-  /*XXX It does not yet handle 32-bit executables on 64-bit Cygwin or v/v.    */
+  /*XXX It does not yet handle 32-bit headers on 64-bit Cygwin or v/v.        */
   IMAGE_NT_HEADERS *inth = (IMAGE_NT_HEADERS *) ptr;
   read_child ((void *) &ntsig, sizeof (ntsig), &inth->Signature, h);
   if (ntsig != IMAGE_NT_SIGNATURE)
@@ -921,7 +922,7 @@ static const char *const opts = "+ehfo:p:qs:Vw";
 static void
 print_version ()
 {
-  printf ("cygmon (Cygwin) %d.%d.%d\n"
+  printf ("cygmon (cygwin) %d.%d.%d\n"
           "System Profiler\n"
           "Copyright © 2016 - %s Cygwin Authors\n"
           "This is free software; see the source for copying conditions.  "
