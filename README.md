@@ -1,7 +1,7 @@
 # _cygmon_
 A sampling process monitor for Cygwin
 
-This project is an experiment in profiling by PC (program counter) sampling.
+This project is an experiment in profiling by IP (instruction pointer) sampling.
 Cygwin already has a built-in profiler (accessed through _gcc_'s -pg compiler
 option), but it has limitations.  One limitation is an inability to record
 samples for dynamically linked libraries.  Another limitation is that the
@@ -25,4 +25,4 @@ programs (like _strace_ and _dumper_) rather than as Cygwin programs.  Navigate
 to the corresponding build location and run _make_.  That will create a
 cygmon.exe that you can place in /usr/local/bin, for instance.
 
-*Note that this is the first beta release for testing by anybody interested.*
+*Note that this is the second beta release for testing by anybody interested.*

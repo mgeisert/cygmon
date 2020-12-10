@@ -1,6 +1,6 @@
 /*
     cygmon.cc
-    Periodically samples PC of a process and its DLLs; writes gprof data files.
+    Periodically samples IP of a process and its DLLs; writes gprof data files.
 
     Written by Mark Geisert <mark@maxrnd.com>, who admits to
     copying pretty liberally from strace.cc.  h/t to cgf for strace!
@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <getopt.h>
+#include <io.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@
 #include "../cygwin/include/sys/cygwin.h"
 #include "../cygwin/include/cygwin/version.h"
 #include "../cygwin/cygtls_padsize.h"
+#include "../cygwin/gcc_seh.h"
 typedef uint16_t u_int16_t; // to work around ancient gmon.h usage
 #include "../cygwin/gmon.h"
 #include "path.h"
@@ -48,14 +50,14 @@ static char       *prefix = (char *) "gmon.out";
 static int         quiet = 1;
 static int         samplerate = 100; // in Hz; up to 1000 might work
 
-static void
+static void __attribute__ ((__noreturn__))
 usage (FILE *where = stderr)
 {
   fprintf (where, "\
 Usage: %s [OPTIONS] <command-line>\n\
    or: %s [OPTIONS] -p <pid>\n\
 \n\
-Profiles a command or a running process by sampling its PC (program counter).\n\
+Profiles a command or process by sampling its IP (instruction pointer).\n\
 OPTIONS are:\n\
 \n\
   -e, --events             Display Windows DEBUG_EVENTS (toggle: default false)\n\
@@ -65,7 +67,7 @@ OPTIONS are:\n\
   -p, --pid=N              Attach to running program with Cygwin pid N\n\
                            ...                    or with Windows pid -N\n\
   -q, --quiet              Suppress resource messages (toggle: default true)\n\
-  -s, --sample-rate=N      Set PC sampling rate to N Hz (default 100)\n\
+  -s, --sample-rate=N      Set IP sampling rate to N Hz (default 100)\n\
   -V, --version            Display version information and exit\n\
   -w, --new-window         Launch given command in a new window\n\
 \n", pgm, pgm);
@@ -92,7 +94,7 @@ struct thread_list
 {
   DWORD   tid;
   HANDLE  hthread;
-  char   *name;
+  WCHAR  *name;
   struct thread_list *next;
 };
 
@@ -185,7 +187,7 @@ sample (HANDLE h)
     }
   else
 //XXX this approach doesn't support 32-bit executables on 64-bit
-#ifdef _WIN64
+#ifdef __x86_64__
     return context->Rip;
 #else
     return context->Eip;
@@ -380,7 +382,7 @@ remove_child (DWORD pid)
 }
 
 static void
-add_thread (DWORD pid, DWORD tid, HANDLE h)
+add_thread (DWORD pid, DWORD tid, HANDLE h, WCHAR *name)
 {
   child *c = get_child (pid);
 
@@ -390,7 +392,7 @@ add_thread (DWORD pid, DWORD tid, HANDLE h)
   thread_list *t = (thread_list *) calloc (1, sizeof (thread_list));
   t->tid = tid;
   t->hthread = h;
-  t->name = NULL;
+  t->name = name;
 
   t->next = c->threads;
   c->threads = t;
@@ -483,7 +485,7 @@ add_span (DWORD pid, WCHAR *name, LPVOID base, HANDLE h)
 
   IMAGE_SECTION_HEADER *sect = find_text_section (base, c->hproc);
   span_list *s = (span_list *) calloc (1, sizeof (span_list));
-  s->name = wcsdup (name);
+  s->name = name;
   s->base = base;
   s->textlo = sect->VirtualAddress + (size_t) base;
   s->texthi = s->textlo + sect->Misc.VirtualSize;
@@ -654,7 +656,6 @@ attach_process (pid_t pid)
       if (h)
         {
           /* Try to turn off DEBUG_ONLY_THIS_PROCESS so we can follow forks */
-          /* This is only supported on XP and later */
           ULONG DebugFlags = DEBUG_PROCESS_DETACH_ON_EXIT;
           NTSTATUS status = NtSetInformationProcess (h, ProcessDebugFlags,
                                         &DebugFlags, sizeof (DebugFlags));
@@ -766,6 +767,25 @@ GetFileNameFromHandle (HANDLE hFile, WCHAR pszFilename[MAX_PATH+1])
   return result;
 }
 
+static char *
+cygwin_pid (DWORD winpid)
+{
+  static char  buf[48];
+  DWORD        cygpid;
+  static DWORD max_cygpid = 0;
+
+  if (!max_cygpid)
+    max_cygpid = (DWORD) cygwin_internal (CW_MAX_CYGWIN_PID);
+
+  cygpid = (DWORD) cygwin_internal (CW_WINPID_TO_CYGWIN_PID, winpid);
+
+  if (cygpid >= max_cygpid)
+    snprintf (buf, sizeof buf, "%lu", winpid);
+  else
+    snprintf (buf, sizeof buf, "%lu (pid: %lu)", winpid, cygpid);
+  return buf;
+}
+
 static DWORD
 profile1 (FILE *ofile, pid_t pid)
 {
@@ -788,16 +808,17 @@ profile1 (FILE *ofile, pid_t pid)
       switch (ev.dwDebugEventCode)
         {
         case CREATE_PROCESS_DEBUG_EVENT:
+          WCHAR exename[MAX_PATH+1];
+
           if (events)
             {
-              WCHAR exename[MAX_PATH+1];
               if (!GetFileNameFromHandle (ev.u.CreateProcessInfo.hFile, exename))
                 wcscpy (exename, L"(unknown)");
 
-              note ("--- Process %lu created from %ls\n",
-                    ev.dwProcessId, exename);
-              note ("--- Process %lu thread %lu created at %p\n",
-                    ev.dwProcessId, ev.dwThreadId,
+              note ("--- Process %s created from %ls\n",
+                    cygwin_pid (ev.dwProcessId), exename);
+              note ("--- Process %s thread %lu created at %p\n",
+                    cygwin_pid (ev.dwProcessId), ev.dwThreadId,
                     ev.u.CreateProcessInfo.lpStartAddress);
             }
           if (ev.u.CreateProcessInfo.hFile)
@@ -806,15 +827,16 @@ profile1 (FILE *ofile, pid_t pid)
                      ev.u.CreateProcessInfo.lpBaseOfImage,
                      ev.u.CreateProcessInfo.hProcess);
           add_thread (ev.dwProcessId, ev.dwThreadId,
-                      ev.u.CreateProcessInfo.hThread);
+                      ev.u.CreateProcessInfo.hThread, wcsdup (exename));
           break;
 
         case CREATE_THREAD_DEBUG_EVENT:
           if (events)
-            note ("--- Process %lu thread %lu created at %p\n",
-                  ev.dwProcessId, ev.dwThreadId,
+            note ("--- Process %s thread %lu created at %p\n",
+                  cygwin_pid (ev.dwProcessId), ev.dwThreadId,
                   ev.u.CreateThread.lpStartAddress);
-          add_thread (ev.dwProcessId, ev.dwThreadId, ev.u.CreateThread.hThread);
+          add_thread (ev.dwProcessId, ev.dwThreadId,
+                      ev.u.CreateThread.hThread, NULL);
           break;
 
         case LOAD_DLL_DEBUG_EVENT:
@@ -826,9 +848,10 @@ profile1 (FILE *ofile, pid_t pid)
             wcscpy (dllname, L"(unknown)");
 
           if (events)
-              note ("--- Process %lu loaded %ls at %p\n",
-                    ev.dwProcessId, dllname, ev.u.LoadDll.lpBaseOfDll);
-          add_span (ev.dwProcessId, dllname,
+              note ("--- Process %s loaded %ls at %p\n",
+                    cygwin_pid (ev.dwProcessId), dllname,
+                    ev.u.LoadDll.lpBaseOfDll);
+          add_span (ev.dwProcessId, wcsdup (dllname),
                     ev.u.LoadDll.lpBaseOfDll, ev.u.LoadDll.hFile);
 
           if (ev.u.LoadDll.hFile)
@@ -837,8 +860,8 @@ profile1 (FILE *ofile, pid_t pid)
 
         case UNLOAD_DLL_DEBUG_EVENT:
           if (events)
-            note ("--- Process %lu unloaded DLL at %p\n",
-                  ev.dwProcessId, ev.u.UnloadDll.lpBaseOfDll);
+            note ("--- Process %s unloaded DLL at %p\n",
+                  cygwin_pid (ev.dwProcessId), ev.u.UnloadDll.lpBaseOfDll);
           break;
 
         case OUTPUT_DEBUG_STRING_EVENT:
@@ -847,36 +870,47 @@ profile1 (FILE *ofile, pid_t pid)
 
         case EXIT_PROCESS_DEBUG_EVENT:
           if (events)
-            note ("--- Process %lu exited with status 0x%lx\n",
-                  ev.dwProcessId, ev.u.ExitProcess.dwExitCode);
+            note ("--- Process %s exited with status 0x%lx\n",
+                  cygwin_pid (ev.dwProcessId), ev.u.ExitProcess.dwExitCode);
           res = ev.u.ExitProcess.dwExitCode;
           remove_child (ev.dwProcessId);
           break;
 
         case EXIT_THREAD_DEBUG_EVENT:
           if (events)
-            note ("--- Process %lu thread %lu exited with status 0x%lx\n",
-                  ev.dwProcessId, ev.dwThreadId, ev.u.ExitThread.dwExitCode);
+            note ("--- Process %s thread %lu exited with status 0x%lx\n",
+                  cygwin_pid (ev.dwProcessId), ev.dwThreadId,
+                  ev.u.ExitThread.dwExitCode);
           remove_thread (ev.dwProcessId, ev.dwThreadId);
           break;
 
         case EXCEPTION_DEBUG_EVENT:
+          status = DBG_EXCEPTION_HANDLED;
           switch (ev.u.Exception.ExceptionRecord.ExceptionCode)
             {
             case MS_VC_EXCEPTION:
               //XXX Decode exception info to get thread name; set it internally
               // fall thru
+
             case STATUS_BREAKPOINT:
-              status = DBG_EXCEPTION_HANDLED;
               break;
+
+#ifdef __x86_64__
+            case STATUS_GCC_THROW:
+            case STATUS_GCC_UNWIND:
+            case STATUS_GCC_FORCED:
+              status = DBG_EXCEPTION_NOT_HANDLED;
+              break;
+#endif
 
             default:
               status = DBG_EXCEPTION_NOT_HANDLED;
               if (ev.u.Exception.dwFirstChance)
-                note ("--- Process %lu thread %lu exception %08x at %p\n",
-                      ev.dwProcessId, ev.dwThreadId,
+                note ("--- Process %s thread %lu exception %08x at %p\n",
+                      cygwin_pid (ev.dwProcessId), ev.dwThreadId,
                       ev.u.Exception.ExceptionRecord.ExceptionCode,
                       ev.u.Exception.ExceptionRecord.ExceptionAddress);
+              break;
             }
           debug_event = ContinueDebugEvent (ev.dwProcessId,
                                             ev.dwThreadId, status);
@@ -919,7 +953,7 @@ struct option longopts[] = {
 
 static const char *const opts = "+ehfo:p:qs:Vw";
 
-static void
+static void __attribute__ ((__noreturn__))
 print_version ()
 {
   printf ("cygmon (cygwin) %d.%d.%d\n"
@@ -932,6 +966,7 @@ print_version ()
           CYGWIN_VERSION_DLL_MAJOR % 1000,
           CYGWIN_VERSION_DLL_MINOR,
           strrchr (__DATE__, ' ') + 1);
+  exit (0);
 }
 
 int
@@ -950,6 +985,9 @@ main2 (int argc, char **argv)
         for (argc = 0, argv = av; *av; av++)
           argc++;
     }
+
+  _setmode (1, _O_BINARY);
+  _setmode (2, _O_BINARY);
 
   if (!(pgm = strrchr (*argv, '\\')) && !(pgm = strrchr (*argv, '/')))
     pgm = *argv;
@@ -970,7 +1008,6 @@ main2 (int argc, char **argv)
       case 'h':
         /* Print help and exit. */
         usage (ofile);
-        break;
 
       case 'o':
         if ((ofile = fopen (cygpath (optarg, NULL), "wb")) == NULL)
@@ -1000,7 +1037,6 @@ main2 (int argc, char **argv)
       case 'V':
         /* Print version info and exit. */
         print_version ();
-        return 0;
 
       case 'w':
         new_window ^= 1;
