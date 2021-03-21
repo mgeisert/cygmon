@@ -25,4 +25,4 @@ programs (like _strace_ and _dumper_) rather than as Cygwin programs.  Navigate
 to the corresponding build location and run _make_.  That will create a
 cygmon.exe that you can place in /usr/local/bin, for instance.
 
-*Note that this is the second beta release for testing by anybody interested.*
+*Note that this is the third beta release for testing by anybody interested.*

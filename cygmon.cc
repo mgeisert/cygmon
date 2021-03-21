@@ -38,19 +38,20 @@ typedef uint16_t u_int16_t; // to work around ancient gmon.h usage
 #define SCALE_SHIFT 2 // == 4 bytes of address space per bucket
 #define MS_VC_EXCEPTION 0x406D1388 // thread name notification from child
 
-static DWORD       child_pid;
-static void       *drive_map;
-static int         events = 0;
-static int         forkdebug = 0;
-static int         new_window;
-static int         numprocesses;
-static FILE       *ofile = stdout;
-static const char *pgm;
-static char       *prefix = (char *) "gmon.out";
-static int         quiet = 1;
-static int         samplerate = 100; // in Hz; up to 1000 might work
+DWORD       child_pid;
+int         debugging = 0;
+void       *drive_map;
+int         events = 0;
+int         forkdebug = 0;
+int         new_window;
+int         numprocesses;
+FILE       *ofile = stdout;
+const char *pgm;
+char       *prefix = (char *) "gmon.out";
+int         samplerate = 100; // in Hz; up to 1000 might work
+int         verbose = 0;
 
-static void __attribute__ ((__noreturn__))
+void __attribute__ ((__noreturn__))
 usage (FILE *where = stderr)
 {
   fprintf (where, "\
@@ -60,16 +61,17 @@ Usage: %s [OPTIONS] <command-line>\n\
 Profiles a command or process by sampling its IP (instruction pointer).\n\
 OPTIONS are:\n\
 \n\
-  -e, --events             Display Windows DEBUG_EVENTS (toggle: default false)\n\
-  -f, --fork-debug         Profile child processes (toggle: default false)\n\
-  -h, --help               Display usage information and exit\n\
-  -o, --output=FILENAME    Write output to file FILENAME rather than stdout\n\
-  -p, --pid=N              Attach to running program with Cygwin pid N\n\
-                           ...                    or with Windows pid -N\n\
-  -q, --quiet              Suppress resource messages (toggle: default true)\n\
-  -s, --sample-rate=N      Set IP sampling rate to N Hz (default 100)\n\
-  -V, --version            Display version information and exit\n\
-  -w, --new-window         Launch given command in a new window\n\
+  -d, --debug            Display debugging messages (toggle: default false)\n\
+  -e, --events           Display Windows DEBUG_EVENTS (toggle: default false)\n\
+  -f, --fork-debug       Profile child processes (toggle: default false)\n\
+  -h, --help             Display usage information and exit\n\
+  -o, --output=FILENAME  Write output to file FILENAME rather than stdout\n\
+  -p, --pid=N            Attach to running program with Cygwin pid N\n\
+                         ...                    or with Windows pid -N\n\
+  -s, --sample-rate=N    Set IP sampling rate to N Hz (default 100)\n\
+  -v, --verbose          Display more status messages (toggle: default false)\n\
+  -V, --version          Display version information and exit\n\
+  -w, --new-window       Launch given command in a new window\n\
 \n", pgm, pgm);
 
   exit (where == stderr ? 1 : 0 );
@@ -114,7 +116,7 @@ struct child_list
 child_list children;
 typedef struct child_list child;
 
-static void
+void
 note (const char *fmt, ...)
 {
   va_list args;
@@ -128,7 +130,7 @@ note (const char *fmt, ...)
   fflush (ofile);
 }
 
-static void
+void
 warn (int geterrno, const char *fmt, ...)
 {
   va_list args;
@@ -148,7 +150,7 @@ warn (int geterrno, const char *fmt, ...)
     }
 }
 
-static void __attribute__ ((noreturn))
+void __attribute__ ((noreturn))
 error (int geterrno, const char *fmt, ...)
 {
   va_list args;
@@ -160,7 +162,7 @@ error (int geterrno, const char *fmt, ...)
   exit (1);
 }
 
-static size_t
+size_t
 sample (HANDLE h)
 {
   static CONTEXT *context = NULL;
@@ -176,12 +178,12 @@ sample (HANDLE h)
     return 0ULL;
   status = GetThreadContext (h, context);
   if (-1U == ResumeThread (h))
-    if (!quiet)
+    if (verbose)
       note ("*** unable to resume thread %d; continuing anyway\n", h);
 
   if (0 == status)
     {
-      if (!quiet)
+      if (verbose)
         note ("*** unable to get context for thread %d\n", h);
       return 0ULL;
     }
@@ -194,7 +196,7 @@ sample (HANDLE h)
 #endif
 }
 
-static void
+void
 bump_bucket (child *c, size_t pc)
 {
   span_list *s = c->spans;
@@ -214,12 +216,12 @@ bump_bucket (child *c, size_t pc)
       s = s->next;
     }
 
-  if (!quiet)
+  if (verbose)
     note ("*** pc %p out of range for pid %lu\n", pc, c->pid);
 }
 
 /* profiler runs on its own thread; each sampled process has separate profiler*/
-static DWORD WINAPI
+DWORD WINAPI
 profiler (void *vp)
 {
   child *c = (child *) vp;
@@ -242,12 +244,12 @@ profiler (void *vp)
   return 0;
 }
 
-static void
+void
 start_profiler (child *c)
 {
   DWORD  tid;
 
-  if (!quiet)
+  if (verbose)
     note ("*** start profiler thread on pid %lu\n", c->pid);
   c->hquitevt = CreateEvent (NULL, TRUE, FALSE, NULL);
   if (!c->hquitevt)
@@ -260,10 +262,10 @@ start_profiler (child *c)
 //SetThreadPriority (c->hprofthr, THREAD_PRIORITY_TIME_CRITICAL); Don't do this!
 }
 
-static void
+void
 stop_profiler (child *c)
 {
-  if (!quiet)
+  if (verbose)
     note ("*** stop profiler thread on pid %lu\n", c->pid);
   c->profiling = 0;
   SignalObjectAndWait (c->hquitevt, c->hprofthr, INFINITE, FALSE);
@@ -273,7 +275,7 @@ stop_profiler (child *c)
 }
 
 /* Create a gmon.out file for each EXE or DLL that has at least one sample. */
-static void
+void
 dump_profile_data (child *c)
 {
   int        fd;
@@ -323,7 +325,7 @@ dump_profile_data (child *c)
 HANDLE lasth;
 DWORD  lastpid = 0;
 
-static child *
+child *
 get_child (DWORD pid)
 {
   child *c;
@@ -335,9 +337,9 @@ get_child (DWORD pid)
   return NULL;
 }
 
-static void add_span (DWORD, WCHAR *, LPVOID, HANDLE);
+void add_span (DWORD, WCHAR *, LPVOID, HANDLE);
 
-static void
+void
 add_child (DWORD pid, LPVOID base, HANDLE hproc)
 {
   if (!get_child (pid))
@@ -350,12 +352,12 @@ add_child (DWORD pid, LPVOID base, HANDLE hproc)
       add_span (pid, NULL, base, hproc);
       start_profiler (children.next);
       numprocesses++;
-      if (!quiet)
+      if (verbose)
         note ("*** Windows process %lu attached\n", pid);
     }
 }
 
-static void
+void
 remove_child (DWORD pid)
 {
   child *c;
@@ -372,7 +374,7 @@ remove_child (DWORD pid)
         CloseHandle (c1->hproc);
         c1->hproc = 0;
         free (c1);
-        if (!quiet)
+        if (verbose)
           note ("*** Windows process %lu detached\n", pid);
         numprocesses--;
         return;
@@ -381,7 +383,7 @@ remove_child (DWORD pid)
   error (0, "no process id %d found", pid);
 }
 
-static void
+void
 add_thread (DWORD pid, DWORD tid, HANDLE h, WCHAR *name)
 {
   child *c = get_child (pid);
@@ -398,7 +400,7 @@ add_thread (DWORD pid, DWORD tid, HANDLE h, WCHAR *name)
   c->threads = t;
 }
 
-static void
+void
 remove_thread (DWORD pid, DWORD tid)
 {
   child *c = get_child (pid);
@@ -426,12 +428,12 @@ remove_thread (DWORD pid, DWORD tid)
   error (0, "remove_thread: pid %lu tid %lu not found\n", pid, tid);
 }
 
-static void
+void
 read_child (void *buf, SIZE_T size, void *addr, HANDLE h)
 {
   SIZE_T len;
 
-  if (!quiet)
+  if (debugging)
     note ("read %d bytes at %p from handle %d\n", size, addr, h);
   if (0 == ReadProcessMemory (h, addr, buf, size, &len))
     error (0, "read_child: failed\n");
@@ -439,7 +441,7 @@ read_child (void *buf, SIZE_T size, void *addr, HANDLE h)
     error (0, "read_child: asked for %d bytes but got %d\n", size, len);
 }
 
-static IMAGE_SECTION_HEADER *
+IMAGE_SECTION_HEADER *
 find_text_section (LPVOID base, HANDLE h)
 {
   static IMAGE_SECTION_HEADER asect;
@@ -475,7 +477,7 @@ find_text_section (LPVOID base, HANDLE h)
   error (0, ".text section not found\n");
 }
 
-static void
+void
 add_span (DWORD pid, WCHAR *name, LPVOID base, HANDLE h)
 {
   child *c = get_child (pid);
@@ -491,7 +493,7 @@ add_span (DWORD pid, WCHAR *name, LPVOID base, HANDLE h)
   s->texthi = s->textlo + sect->Misc.VirtualSize;
   s->numbuckets = (s->texthi - s->textlo) >> SCALE_SHIFT;
   s->buckets = (short *) calloc (s->numbuckets, sizeof (short));
-  if (!quiet)
+  if (debugging)
     note ("    span %p - %p, size %X, numbuckets %d\n",
           s->textlo, s->texthi, s->texthi - s->textlo, s->numbuckets);
 
@@ -561,7 +563,7 @@ linebuf::prepend (const char *what, int len)
   ix = newix;
 }
 
-static void
+void
 make_command_line (linebuf & one_line, char **argv)
 {
   for (; *argv; argv++)
@@ -594,7 +596,7 @@ make_command_line (linebuf & one_line, char **argv)
     one_line.add ("", 1);
 }
 
-static BOOL WINAPI
+BOOL WINAPI
 ctrl_c (DWORD)
 {
   static int tic = 1;
@@ -610,7 +612,7 @@ uintptr_t (*cygwin_internal) (int, ...);
 WCHAR cygwin_dll_path[32768];
 };
 
-static int
+int
 load_cygwin ()
 {
   static HMODULE h;
@@ -640,7 +642,7 @@ load_cygwin ()
 #define DEBUG_PROCESS_DETACH_ON_EXIT    0x00000001
 #define DEBUG_PROCESS_ONLY_THIS_PROCESS 0x00000002
 
-static void
+void
 attach_process (pid_t pid)
 {
   child_pid = pid < 0 ? (DWORD) -pid :
@@ -670,7 +672,7 @@ attach_process (pid_t pid)
   return;
 }
 
-static void
+void
 create_child (char **argv)
 {
   DWORD               flags;
@@ -723,7 +725,7 @@ create_child (char **argv)
   SetConsoleCtrlHandler (ctrl_c, 1);
 }
 
-static void
+void
 handle_output_debug_string (DWORD pid, OUTPUT_DEBUG_STRING_INFO *ev)
 {
   /*XXX This code doesn't support Unicode debug strings received from child. */
@@ -735,14 +737,14 @@ handle_output_debug_string (DWORD pid, OUTPUT_DEBUG_STRING_INFO *ev)
 
   read_child (buf, ev->nDebugStringLength, ev->lpDebugStringData, c->hproc);
   if (strncmp (buf, "cYg", 3))
-    note (buf);
+    note (buf); // not from Cygwin, from the target app; just display it
   else
     {
-      //XXX Possibly decode and display Cygwin internal msg traffic differently
+      //XXX Possibly decode and display Cygwin-internal debug string passed in
     }
 }
 
-static BOOL
+BOOL
 GetFileNameFromHandle (HANDLE hFile, WCHAR pszFilename[MAX_PATH+1])
 {
   BOOL     result = FALSE;
@@ -767,7 +769,7 @@ GetFileNameFromHandle (HANDLE hFile, WCHAR pszFilename[MAX_PATH+1])
   return result;
 }
 
-static char *
+char *
 cygwin_pid (DWORD winpid)
 {
   static char  buf[48];
@@ -786,7 +788,7 @@ cygwin_pid (DWORD winpid)
   return buf;
 }
 
-static DWORD
+DWORD
 profile1 (FILE *ofile, pid_t pid)
 {
   DEBUG_EVENT ev;
@@ -927,7 +929,7 @@ profile1 (FILE *ofile, pid_t pid)
   return res;
 }
 
-static DWORD
+DWORD
 doprofile (FILE *ofile, pid_t pid, char **argv)
 {
   if (pid)
@@ -939,21 +941,22 @@ doprofile (FILE *ofile, pid_t pid, char **argv)
 }
 
 struct option longopts[] = {
+  {"debug",       no_argument,       NULL, 'd'},
   {"events",      no_argument,       NULL, 'e'},
   {"help",        no_argument,       NULL, 'h'},
   {"new-window",  no_argument,       NULL, 'w'},
   {"output",      required_argument, NULL, 'o'},
   {"pid",         required_argument, NULL, 'p'},
   {"fork-debug",  no_argument,       NULL, 'f'},
-  {"quiet",       no_argument,       NULL, 'q'},
   {"sample-rate", required_argument, NULL, 's'},
+  {"verbose",     no_argument,       NULL, 'v'},
   {"version",     no_argument,       NULL, 'V'},
   {NULL,          0,                 NULL, 0  }
 };
 
-static const char *const opts = "+ehfo:p:qs:Vw";
+const char *const opts = "+dehfo:p:s:vVw";
 
-static void __attribute__ ((__noreturn__))
+void __attribute__ ((__noreturn__))
 print_version ()
 {
   printf ("cygmon (cygwin) %d.%d.%d\n"
@@ -976,7 +979,6 @@ main2 (int argc, char **argv)
   pid_t  pid = 0;
   char  *ptr;
   DWORD  ret = 0;
-  int    sawquiet = -1;
 
   if (load_cygwin ())
     {
@@ -997,8 +999,18 @@ main2 (int argc, char **argv)
   while ((opt = getopt_long (argc, argv, opts, longopts, NULL)) != EOF)
     switch (opt)
       {
+      case 'd':
+        debugging ^= 1;
+        if (debugging)
+          {
+            verbose = 1; // debugging turns on verbose too
+            events = 1; // debugging turns on events too
+          }
+        break;
+
       case 'e':
         events ^= 1;
+        events |= debugging; // debugging turns on events too
         break;
 
       case 'f':
@@ -1021,17 +1033,15 @@ main2 (int argc, char **argv)
         pid = strtoul (optarg, NULL, 10);
         break;
 
-      case 'q':
-        if (sawquiet < 0)
-          sawquiet = 1;
-        else
-          sawquiet ^= 1;
-        break;
-
       case 's':
         samplerate = strtoul (optarg, NULL, 10);
         if (samplerate < 1 || samplerate > 1000)
           error (0, "sample rate must be between 1 and 1000 inclusive");
+        break;
+
+      case 'v':
+        verbose ^= 1;
+        verbose |= debugging; // debugging turns on verbose too
         break;
 
       case 'V':
@@ -1052,13 +1062,6 @@ main2 (int argc, char **argv)
 
   if (!pid && !argv[optind])
     error (0, "must provide either a command line or a process id");
-
-  if (!pid)
-    quiet = sawquiet < 0 || !sawquiet;
-  else if (sawquiet < 0)
-    quiet = 0;
-  else
-    quiet = sawquiet;
 
   /* Honor user-supplied profiler output file name prefix, if available. */
   ptr = getenv ("GMON_OUT_PREFIX");
