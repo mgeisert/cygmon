@@ -30,6 +30,7 @@
 #include "../cygwin/include/cygwin/version.h"
 #include "../cygwin/cygtls_padsize.h"
 #include "../cygwin/gcc_seh.h"
+typedef unsigned short ushort;
 typedef uint16_t u_int16_t; // to work around ancient gmon.h usage
 #include "../cygwin/gmon.h"
 #include "path.h"
@@ -42,7 +43,7 @@ DWORD       child_pid;
 int         debugging = 0;
 void       *drive_map;
 int         events = 0;
-int         forkdebug = 0;
+int         forkprofile = 0;
 int         new_window;
 int         numprocesses;
 FILE       *ofile = stdout;
@@ -57,14 +58,16 @@ usage (FILE *where = stderr)
   fprintf (where, "\
 Usage: %s [OPTIONS] <command-line>\n\
    or: %s [OPTIONS] -p <pid>\n\
+   or: %s -i <filename>...\n\
 \n\
 Profiles a command or process by sampling its IP (instruction pointer).\n\
 OPTIONS are:\n\
 \n\
   -d, --debug            Display debugging messages (toggle: default false)\n\
   -e, --events           Display Windows DEBUG_EVENTS (toggle: default false)\n\
-  -f, --fork-debug       Profile child processes (toggle: default false)\n\
+  -f, --fork-profile     Profile child processes (toggle: default false)\n\
   -h, --help             Display usage information and exit\n\
+  -i, --info=FILENAME(S) Display summary info about given profile data file(s)\n\
   -o, --output=FILENAME  Write output to file FILENAME rather than stdout\n\
   -p, --pid=N            Attach to running program with Cygwin pid N\n\
                          ...                    or with Windows pid -N\n\
@@ -72,7 +75,7 @@ OPTIONS are:\n\
   -v, --verbose          Display more status messages (toggle: default false)\n\
   -V, --version          Display version information and exit\n\
   -w, --new-window       Launch given command in a new window\n\
-\n", pgm, pgm);
+\n", pgm, pgm, pgm);
 
   exit (where == stderr ? 1 : 0 );
 }
@@ -87,7 +90,7 @@ struct span_list
   int     hitcount;
   int     hitbuckets;
   int     numbuckets;
-  short  *buckets;
+  int    *buckets;
   struct span_list *next;
 };
 
@@ -188,7 +191,7 @@ sample (HANDLE h)
       return 0ULL;
     }
   else
-//XXX this approach doesn't support 32-bit executables on 64-bit
+//TODO this approach might not support 32-bit executables on 64-bit
 #ifdef __x86_64__
     return context->Rip;
 #else
@@ -310,16 +313,135 @@ dump_profile_data (child *c)
       hdr.version = GMONVERSION;
       hdr.profrate = samplerate;
 
+      /* Our buckets hold more than gmon standard buckets, so truncate here. */
+      ushort *gmonbuckets = (ushort *) calloc (s->numbuckets, sizeof (ushort));
+      for (int i = 0; i < s->numbuckets; i++)
+        {
+          if (s->buckets[i])
+            {
+              if (s->buckets[i] > 65535)
+                {
+                  note ("  WARNING: bucket %d: value %d truncated to %d\n",
+                        i, s->buckets[i], 65535);
+                  gmonbuckets[i] = 65535;
+                }
+              else
+                gmonbuckets[i] = s->buckets[i];
+            }
+        }
+
       write (fd, &hdr, sizeof (hdr));
-      write (fd, s->buckets, hdr.ncnt - sizeof (hdr));
+      write (fd, gmonbuckets, hdr.ncnt - sizeof (hdr));
       note ("%d %s across %d %s written to %s\n", s->hitcount,
             s->hitcount == 1 ? "sample" : "samples", s->hitbuckets,
             s->hitbuckets == 1 ? "bucket" : "buckets", filename);
       close (fd);
-      chmod (filename, S_IRUSR | S_IWUSR); //XXX lose 'x' perms if possible
+      chmod (filename, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);//XXX ineffective
+      free (gmonbuckets);
 
       s = s->next;
     }
+}
+
+void
+info_profile_file (char *filename)
+{
+  ushort    *bucket = NULL;
+  int        fd;
+  struct gmonhdr hdr;
+  int        hitbuckets;
+  int        hitcount;
+  int        numbuckets;
+  int        numrawarcs;
+  struct rawarc *rawarc = NULL;
+  int        res;
+  struct stat stat;
+
+  fd = open (filename, O_RDONLY | O_BINARY);
+  if (fd < 0)
+    {
+      note ("file %s couldn't be opened; continuing\n", filename);
+      return;
+    }
+
+  /* Read and sanity-check what should be a gmon header */
+  res = fstat (fd, &stat);
+  if (res < 0)
+    goto notgmon;
+  if (S_IFREG != (stat.st_mode & S_IFMT))
+    goto notgmon;
+  res = read (fd, &hdr, sizeof (hdr));
+  if (res != sizeof (hdr))
+    goto notgmon;
+  if (hdr.lpc >= hdr.hpc)
+    goto notgmon;
+  numrawarcs = 0;
+  if (stat.st_size != hdr.ncnt)
+    {
+      numrawarcs = stat.st_size - hdr.ncnt;
+      if (numrawarcs !=
+          (int) sizeof (rawarc) * (numrawarcs / (int) sizeof (rawarc)))
+        goto notgmon;
+      numrawarcs /= (int) sizeof (rawarc);
+    }
+
+  /* Looks good, so read and display the profiling info */
+  numbuckets = (hdr.ncnt - sizeof (hdr)) / sizeof (short);
+  bucket = (ushort *) calloc (numbuckets, sizeof (ushort));
+  res = read (fd, bucket, hdr.ncnt - sizeof (hdr));
+  if (res != hdr.ncnt - (int) sizeof (hdr))
+    goto notgmon;
+  hitcount = hitbuckets = 0;
+  for (res = 0; res < numbuckets; ++bucket, ++res)
+    if (*bucket)
+      {
+        ++hitbuckets;
+        hitcount += *bucket;
+      }
+  bucket -= numbuckets;
+
+  note ("file %s, gmon version 0x%x, sample rate %d\n",
+        filename, hdr.version, hdr.profrate);
+  note ("  address range 0x%p..0x%p\n", hdr.lpc, hdr.hpc);
+  note ("  numbuckets %d, hitbuckets %d, hitcount %d, numrawarcs %d\n",
+        numbuckets, hitbuckets, hitcount, numrawarcs);
+
+  /* If verbose is set, display contents of buckets and rawarcs arrays */
+  if (verbose)
+    {
+      if (hitbuckets)
+        note ("  bucket data follows...\n");
+      char *addr = (char *) hdr.lpc;
+      int   incr = (hdr.hpc - hdr.lpc) / numbuckets;
+      for (res = 0; res < numbuckets; ++bucket, ++res, addr += incr)
+        if (*bucket)
+          note ("    address 0x%p, hitcount %d\n", addr, *bucket);
+      bucket -= numbuckets;
+
+      if (numrawarcs)
+        {
+          rawarc = (struct rawarc *) calloc (numrawarcs, sizeof (rawarc));
+          res = read (fd, rawarc, numrawarcs * (int) sizeof (rawarc));
+          if (res != numrawarcs * (int) sizeof (rawarc))
+            error (0, "unable to read rawarc data");
+          note ("  rawarc data follows...\n");
+          for (res = 0; res < numrawarcs; ++rawarc, ++res)
+            note ("    from 0x%p, self 0x%p, count %d\n",
+                  rawarc->raw_frompc, rawarc->raw_selfpc, rawarc->raw_count);
+        }
+    }
+
+  note ("\n");
+  if (0)
+    {
+notgmon:
+      note ("file %s isn't a profile data file; continuing\n", filename);
+    }
+  if (rawarc)
+    free (rawarc);
+  if (bucket)
+    free (bucket);
+  close (fd);
 }
 
 HANDLE lasth;
@@ -340,7 +462,7 @@ get_child (DWORD pid)
 void add_span (DWORD, WCHAR *, LPVOID, HANDLE);
 
 void
-add_child (DWORD pid, LPVOID base, HANDLE hproc)
+add_child (DWORD pid, WCHAR *name, LPVOID base, HANDLE hproc)
 {
   if (!get_child (pid))
     {
@@ -349,7 +471,7 @@ add_child (DWORD pid, LPVOID base, HANDLE hproc)
       children.next->next = c;
       lastpid = children.next->pid = pid;
       lasth = children.next->hproc = hproc;
-      add_span (pid, NULL, base, hproc);
+      add_span (pid, name, base, hproc);
       start_profiler (children.next);
       numprocesses++;
       if (verbose)
@@ -413,7 +535,7 @@ remove_thread (DWORD pid, DWORD tid)
     {
       if (t->tid == tid)
         {
-          /* We don't free(t), we just zero it out. Maybe revisit this. */
+          /*TODO We don't free(t), we just zero it out. Maybe revisit this. */
           t->tid = 0;
           CloseHandle (t->hthread);
           t->hthread = 0;
@@ -446,6 +568,7 @@ find_text_section (LPVOID base, HANDLE h)
 {
   static IMAGE_SECTION_HEADER asect;
   DWORD  lfanew;
+  WORD   machine;
   WORD   nsects;
   DWORD  ntsig;
   char  *ptr = (char *) base;
@@ -455,11 +578,20 @@ find_text_section (LPVOID base, HANDLE h)
   ptr += lfanew;
 
   /* Code handles 32- or 64-bit headers depending on compilation environment. */
-  /*XXX It does not yet handle 32-bit headers on 64-bit Cygwin or v/v.        */
+  /*TODO It doesn't yet handle 32-bit headers on 64-bit Cygwin or v/v.        */
   IMAGE_NT_HEADERS *inth = (IMAGE_NT_HEADERS *) ptr;
   read_child ((void *) &ntsig, sizeof (ntsig), &inth->Signature, h);
   if (ntsig != IMAGE_NT_SIGNATURE)
     error (0, "find_text_section: NT signature not found\n");
+
+  read_child ((void *) &machine, sizeof (machine),
+              &inth->FileHeader.Machine, h);
+#ifdef __x86_64__
+  if (machine != IMAGE_FILE_MACHINE_AMD64)
+#else
+  if (machine != IMAGE_FILE_MACHINE_I386)
+#endif
+    error (0, "target program was built for different machine architecture\n");
 
   read_child ((void *) &nsects, sizeof (nsects),
               &inth->FileHeader.NumberOfSections, h);
@@ -492,7 +624,7 @@ add_span (DWORD pid, WCHAR *name, LPVOID base, HANDLE h)
   s->textlo = sect->VirtualAddress + (size_t) base;
   s->texthi = s->textlo + sect->Misc.VirtualSize;
   s->numbuckets = (s->texthi - s->textlo) >> SCALE_SHIFT;
-  s->buckets = (short *) calloc (s->numbuckets, sizeof (short));
+  s->buckets = (int *) calloc (s->numbuckets, sizeof (int));
   if (debugging)
     note ("    span %p - %p, size %X, numbuckets %d\n",
           s->textlo, s->texthi, s->texthi - s->textlo, s->numbuckets);
@@ -651,7 +783,7 @@ attach_process (pid_t pid)
   if (!DebugActiveProcess (child_pid))
     error (0, "couldn't attach to pid %d for debugging", child_pid);
 
-  if (forkdebug)
+  if (forkprofile)
     {
       HANDLE h = OpenProcess (PROCESS_ALL_ACCESS, FALSE, child_pid);
 
@@ -687,7 +819,7 @@ create_child (char **argv)
   si.cb = sizeof (si);
 
   flags = CREATE_DEFAULT_ERROR_MODE
-          | (forkdebug ? DEBUG_PROCESS : DEBUG_ONLY_THIS_PROCESS);
+          | (forkprofile ? DEBUG_PROCESS : DEBUG_ONLY_THIS_PROCESS);
   if (new_window)
     flags |= CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
 
@@ -728,7 +860,6 @@ create_child (char **argv)
 void
 handle_output_debug_string (DWORD pid, OUTPUT_DEBUG_STRING_INFO *ev)
 {
-  /*XXX This code doesn't support Unicode debug strings received from child. */
   char  *buf = (char *) alloca (ev->nDebugStringLength);
   child *c = get_child (pid);
 
@@ -737,11 +868,13 @@ handle_output_debug_string (DWORD pid, OUTPUT_DEBUG_STRING_INFO *ev)
 
   read_child (buf, ev->nDebugStringLength, ev->lpDebugStringData, c->hproc);
   if (strncmp (buf, "cYg", 3))
-    note (buf); // not from Cygwin, from the target app; just display it
-  else
-    {
-      //XXX Possibly decode and display Cygwin-internal debug string passed in
+    { // string is not from Cygwin, it's from the target app; just display it
+      if (ev->fUnicode)
+        note ("%ls", buf);
+      else
+        note ("%s", buf);
     }
+  //else TODO Possibly decode and display Cygwin-internal debug string
 }
 
 BOOL
@@ -804,7 +937,8 @@ profile1 (FILE *ofile, pid_t pid)
         continue;
 
       /* Usually continue event here so child resumes while we process event. */
-      if (ev.dwDebugEventCode != EXCEPTION_DEBUG_EVENT)
+      if (ev.dwDebugEventCode != EXCEPTION_DEBUG_EVENT &&
+          ev.dwDebugEventCode != OUTPUT_DEBUG_STRING_EVENT)
         debug_event = ContinueDebugEvent (ev.dwProcessId, ev.dwThreadId, status);
 
       switch (ev.dwDebugEventCode)
@@ -812,11 +946,10 @@ profile1 (FILE *ofile, pid_t pid)
         case CREATE_PROCESS_DEBUG_EVENT:
           WCHAR exename[MAX_PATH+1];
 
+          if (!GetFileNameFromHandle (ev.u.CreateProcessInfo.hFile, exename))
+            wcscpy (exename, L"(unknown)");
           if (events)
             {
-              if (!GetFileNameFromHandle (ev.u.CreateProcessInfo.hFile, exename))
-                wcscpy (exename, L"(unknown)");
-
               note ("--- Process %s created from %ls\n",
                     cygwin_pid (ev.dwProcessId), exename);
               note ("--- Process %s thread %lu created at %p\n",
@@ -825,7 +958,7 @@ profile1 (FILE *ofile, pid_t pid)
             }
           if (ev.u.CreateProcessInfo.hFile)
             CloseHandle (ev.u.CreateProcessInfo.hFile);
-          add_child (ev.dwProcessId,
+          add_child (ev.dwProcessId, wcsdup (exename),
                      ev.u.CreateProcessInfo.lpBaseOfImage,
                      ev.u.CreateProcessInfo.hProcess);
           add_thread (ev.dwProcessId, ev.dwThreadId,
@@ -868,6 +1001,9 @@ profile1 (FILE *ofile, pid_t pid)
 
         case OUTPUT_DEBUG_STRING_EVENT:
           handle_output_debug_string (ev.dwProcessId, &ev.u.DebugString);
+          status = DBG_EXCEPTION_HANDLED;
+          debug_event = ContinueDebugEvent (ev.dwProcessId,
+                                            ev.dwThreadId, status);
           break;
 
         case EXIT_PROCESS_DEBUG_EVENT:
@@ -891,7 +1027,7 @@ profile1 (FILE *ofile, pid_t pid)
           switch (ev.u.Exception.ExceptionRecord.ExceptionCode)
             {
             case MS_VC_EXCEPTION:
-              //XXX Decode exception info to get thread name; set it internally
+              //TODO Decode exception info to get thread name; set it internally
               // fall thru
 
             case STATUS_BREAKPOINT:
@@ -944,24 +1080,25 @@ struct option longopts[] = {
   {"debug",       no_argument,       NULL, 'd'},
   {"events",      no_argument,       NULL, 'e'},
   {"help",        no_argument,       NULL, 'h'},
+  {"info",        required_argument, NULL, 'i'},
   {"new-window",  no_argument,       NULL, 'w'},
   {"output",      required_argument, NULL, 'o'},
   {"pid",         required_argument, NULL, 'p'},
-  {"fork-debug",  no_argument,       NULL, 'f'},
+  {"fork-profile",no_argument,       NULL, 'f'},
   {"sample-rate", required_argument, NULL, 's'},
   {"verbose",     no_argument,       NULL, 'v'},
   {"version",     no_argument,       NULL, 'V'},
   {NULL,          0,                 NULL, 0  }
 };
 
-const char *const opts = "+dehfo:p:s:vVw";
+const char *const opts = "+dehi:fo:p:s:vVw";
 
 void __attribute__ ((__noreturn__))
 print_version ()
 {
   printf ("cygmon (cygwin) %d.%d.%d\n"
-          "System Profiler\n"
-          "Copyright © 2016 - %s Cygwin Authors\n"
+          "Program Profiler\n"
+          "Copyright (C) 2016 - %s Cygwin Authors\n"
           "This is free software; see the source for copying conditions.  "
           "There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS "
           "FOR A PARTICULAR PURPOSE.\n",
@@ -1002,10 +1139,7 @@ main2 (int argc, char **argv)
       case 'd':
         debugging ^= 1;
         if (debugging)
-          {
-            verbose = 1; // debugging turns on verbose too
-            events = 1; // debugging turns on events too
-          }
+          verbose = events = 1; // debugging turns these on too
         break;
 
       case 'e':
@@ -1014,12 +1148,25 @@ main2 (int argc, char **argv)
         break;
 
       case 'f':
-        forkdebug ^= 1;
+        forkprofile ^= 1;
         break;
 
       case 'h':
         /* Print help and exit. */
         usage (ofile);
+
+      case 'i':
+        --optind;
+        while (optind < argc)
+          {
+            if (argv[optind][0] == '-')
+              break;
+            info_profile_file (argv[optind]);
+            ++optind;
+          }
+        if (optind >= argc)
+          exit (0);
+        break;
 
       case 'o':
         if ((ofile = fopen (cygpath (optarg, NULL), "wb")) == NULL)

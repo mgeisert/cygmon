@@ -19,10 +19,10 @@ child processes forked from the initially profiled process.
 This project assumes you are already set up to build the Cygwin DLL.  In your
 Cygwin source tree, navigate to the winsup/utils directory.  Copy cygmon.cc
 from this project into that directory.  Merge (carefully) the contents of
-Makefile.in from the project into the version in that directory.  The effect of
-the merge is to add _cygmon_ to the list of utilities built as Windows native
-programs (like _strace_ and _dumper_) rather than as Cygwin programs.  Navigate
-to the corresponding build location and run _make_.  That will create a
-cygmon.exe that you can place in /usr/local/bin, for instance.
+mingw/Makefile.am from this project into the version in winsup/utils/mingw.
+The effect of the merge is to add _cygmon_ to the list of utilities built as
+Windows native programs (like _strace_ and _dumper_) rather than as Cygwin
+programs.  Navigate to the corresponding build location and run _make_.  That
+will create a cygmon.exe that you can place in /usr/local/bin, for instance.
 
-*Note that this is the third beta release for testing by anybody interested.*
+*Note that this is the final beta release for testing by anybody interested.*
